@@ -1,0 +1,4 @@
+output/*.jpg
+.env
+__pycache__/
+.transcripts/
