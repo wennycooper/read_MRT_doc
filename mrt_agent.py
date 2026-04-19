@@ -8,9 +8,9 @@ Strategy:
   2. Once correct pages confirmed, render them as JPEG (PyMuPDF).
   3. Open images with xdg-open so engineers see original tables/figures.
 
-Tools: get_pdf_info, read_pdf_pages, render_pdf_pages, open_files,
-       web_search, bash, read_file, write_file, edit_file,
-       load_skill, todo, task, compact
+Tools: list_pdfs, get_pdf_info, read_pdf_pages, search_pdf_text,
+       render_pdf_pages, open_files, web_search, bash, read_file,
+       write_file, edit_file, load_skill, todo, task, compact
 """
 
 import json
@@ -146,39 +146,36 @@ class TodoManager:
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 TODO = TodoManager()
 
-PDF_PATH = "MRT_docs/系統概述(PSDS-M6) 號誌系統 - 月臺門操作及維修手冊-0A版.pdf"
+SYSTEM = f"""You are an AI assistant specialized in answering questions about MRT maintenance manuals.
+All PDF documents are located in: {WORKDIR}/MRT_docs/
 
-SYSTEM = f"""You are an AI assistant specialized in answering questions about the New Taipei MRT
-platform screen door (PSD) operation and maintenance manual.
-
-=== DOCUMENT ===
-The PDF file path (relative to workspace) is ALWAYS:
-  {PDF_PATH}
-Use this exact path for ALL pdf tools. Never guess or invent a different filename.
-
-Your goal: find the relevant pages, show the engineer the ORIGINAL document images.
+Your goal: find the relevant pages across multiple PDFs, show the engineer the ORIGINAL document images.
 
 === MANDATORY WORKFLOW ===
 
-Step 1 — load_skill("pdf-reading") FIRST before reading any PDF.
-Step 2 — get_pdf_info to know total pages.
-Step 3 — read_pdf_pages("...", "1-15") to find the Table of Contents.
+Step 1 — load_skill("pdf-reading") FIRST.
+Step 2 — list_pdfs() → see all available PDFs with filenames and sizes.
+Step 3 — RANK the PDFs by relevance to the question:
+         Read the filenames carefully. Based on keywords in the question, decide which PDF(s)
+         are most likely to contain the answer. State your ranking and reasoning explicitly.
+         Example: "問題關於月臺門維修 → 含'月臺門'或'PSD'的 PDF 優先"
+Step 4 — For the top-ranked PDF: search_pdf_text(path, 關鍵字) to quickly confirm it has content.
+         If no match → try the next ranked PDF. Repeat until a match is found.
+Step 5 — Once confirmed: read_pdf_pages(path, "1-15") to find the Table of Contents.
          Write out the FULL TOC (all chapters + subsections with printed page numbers).
-Step 4 — search_pdf_text with Chinese/English keywords to find the physical page directly.
-         Example: search_pdf_text(path, "4.4.2") or search_pdf_text(path, "自動滑門預防性維修計畫")
-         This returns BOTH physical page AND detected printed page — use this to locate content fast.
-Step 5 — read_pdf_pages ONE physical page at a time to VERIFY correct location.
+Step 6 — search_pdf_text again with more specific keywords to get the exact physical page.
+Step 7 — read_pdf_pages ONE physical page at a time to VERIFY correct location.
          Each result header shows: "Physical Page N | Printed page number detected: [X]"
-         ALWAYS read this header and explicitly state: "Printed page on physical {{N}} is {{X}}."
-         If X ≠ expected printed page → adjust: new_physical = N + (expected - X), then re-read.
-Step 6 — Keep reading (text layer) until a NEW section heading appears (Rule 2 from skill).
+         ALWAYS state: "Physical {{N}} 的印刷頁碼是 {{X}}。"
+         If X ≠ expected → adjust: new_physical = current + (expected - X), re-read.
+Step 8 — Keep reading until a NEW section heading appears (Rule 2).
          ⚠️  MANDATORY: After finding content on page N, ALWAYS read page N+1.
-         If N+1 starts with a new heading (e.g. "4.4.3", "5.") → section ends at N.
-         If N+1 continues the same section → collect it, then read N+2. Repeat.
-         NEVER stop based on "the current page looks complete." Stop only after seeing N+1.
-Step 7 — render_pdf_pages with confirmed physical page numbers → JPEG saved to output/.
-Step 8 — open_files to display images.
-Step 9 — Text summary in Traditional Chinese, with <AvailableImageFiles> tag.
+         If N+1 starts new heading → section ends at N.
+         If N+1 continues → collect, read N+2. Repeat.
+         NEVER stop without reading the next page.
+Step 9 — render_pdf_pages with confirmed physical page numbers → JPEG saved to output/.
+Step 10 — open_files to display images.
+Step 11 — Text summary in Traditional Chinese, with <AvailableImageFiles> tag.
 
 === PAGE NAVIGATION (critical) ===
 
@@ -310,6 +307,22 @@ def safe_path(p: str) -> Path:
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
+
+
+def run_list_pdfs() -> str:
+    """List all PDF files in MRT_docs/ with sizes."""
+    pdf_dir = WORKDIR / "MRT_docs"
+    if not pdf_dir.exists():
+        return "Error: MRT_docs/ directory not found."
+    pdfs = sorted(pdf_dir.glob("*.pdf"))
+    if not pdfs:
+        return "No PDF files found in MRT_docs/."
+    lines = [f"Found {len(pdfs)} PDF(s) in MRT_docs/:\n"]
+    for p in pdfs:
+        size_mb = p.stat().st_size / (1024 * 1024)
+        rel = f"MRT_docs/{p.name}"
+        lines.append(f"  [{size_mb:.1f} MB] {rel}")
+    return "\n".join(lines)
 
 
 def run_get_pdf_info(path: str) -> str:
@@ -573,6 +586,7 @@ def run_web_search(query: str, num_results: int = 5) -> str:
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────────
 TOOL_HANDLERS = {
+    "list_pdfs":         lambda **kw: run_list_pdfs(),
     "bash":              lambda **kw: run_bash(kw["command"]),
     "read_file":         lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":        lambda **kw: run_write(kw["path"], kw["content"]),
@@ -589,6 +603,15 @@ TOOL_HANDLERS = {
 }
 
 CHILD_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_pdfs",
+        "description": (
+            "List all PDF files available in MRT_docs/. "
+            "Always call this FIRST (after load_skill) to discover available documents "
+            "before deciding which PDF to search."
+        ),
+        "parameters": {"type": "object", "properties": {}}
+    }},
     {"type": "function", "function": {
         "name": "bash", "description": "Run a shell command.",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
@@ -808,6 +831,8 @@ def agent_loop(messages: list):
             if name == "todo":
                 print(f"> todo:\n{output}")
                 used_todo = True
+            elif name == "list_pdfs":
+                print(f"> list_pdfs:\n{str(output)}")
             elif name == "read_pdf_pages":
                 preview = str(output)[:300]
                 print(f"> read_pdf_pages (p.{args.get('pages', '?')}): {preview}...")
