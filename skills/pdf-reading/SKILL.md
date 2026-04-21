@@ -106,7 +106,8 @@ one stream). If extracted text looks garbled or out of order:
 
 For large PDFs (100+ pages):
 1. `get_pdf_info` → know total pages
-2. Read pages 1-15 → find Table of Contents
+2. Read pages 1-5 → find Table of Contents. If the last page still has TOC entries,
+   keep reading in batches of 5 until a page with no TOC content appears.
 3. **MANDATORY: Write out the complete TOC before doing anything else.**
 
    After reading the TOC pages, your VERY NEXT output MUST be a list like this

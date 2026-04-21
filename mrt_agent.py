@@ -170,7 +170,10 @@ Step 3 — RANK the PDFs by relevance to the question:
          Example: "問題關於月臺門維修 → 含'月臺門'或'PSD'的 PDF 優先"
 Step 4 — For the top-ranked PDF: search_pdf_text(path, 關鍵字) to quickly confirm it has content.
          If no match → try the next ranked PDF. Repeat until a match is found.
-Step 5 — Once confirmed: read_pdf_pages(path, "1-15") to find the Table of Contents.
+Step 5 — Once confirmed: read_pdf_pages(path, "1-5") to find the Table of Contents.
+         If the last page read still contains TOC entries (e.g. chapter/section lines with page numbers),
+         keep reading in batches of 5 (read "6-10", then "11-15" if needed) until you reach a page
+         that no longer has TOC content.
          Write out the FULL TOC (all chapters + subsections with printed page numbers).
 Step 6 — search_pdf_text again with more specific keywords to get the exact physical page.
 Step 7 — read_pdf_pages ONE physical page at a time to VERIFY correct location.
