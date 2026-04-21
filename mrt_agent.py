@@ -54,6 +54,15 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 6
+SESSION_READS_FILE = OUTPUT_DIR / "session_reads.md"
+CONTENT_TOOLS = {"read_pdf_pages", "search_pdf_text"}
+
+
+def _session_append(tool_name: str, args: dict, content: str):
+    """Append a tool result to the session reads file for later retrieval."""
+    with open(SESSION_READS_FILE, "a", encoding="utf-8") as f:
+        label = ", ".join(f"{k}={v}" for k, v in args.items())
+        f.write(f"\n\n---\n## [{tool_name}] {label}\n\n{content}\n")
 
 
 # ── SkillLoader ────────────────────────────────────────────────────────────────
@@ -181,12 +190,23 @@ Step 11 — Text summary in Traditional Chinese, with <AvailableImageFiles> tag.
 
 Physical page ≠ printed page. NEVER assume they match.
 
-The read_pdf_pages header now tells you the printed page number automatically:
-  "--- Physical Page 110 | Printed page number detected: [101] ---"
-  → This page's printed number is 101. If you wanted printed p.101, you found it ✓
+Each read_pdf_pages result now includes:
+  [HEADER LINES]  ← first 3 lines of the page
+  [FOOTER LINES]  ← last 3 lines of the page
 
-If the detected printed number is wrong:
-  offset = physical - printed  (e.g. 110 - 101 = 9)
+HOW TO FIND THE PRINTED PAGE NUMBER:
+  Look at [HEADER LINES] and [FOOTER LINES] for a page number.
+  Common formats (varies by document):
+    - "SYL-TK01-OPM-ESN-0005-0A - 92 - OCT, 2025"  → printed page is 92
+    - "- 92 -"                                        → printed page is 92
+    - "92"  (standalone short line)                   → printed page is 92
+    - "第92頁"                                         → printed page is 92
+  The number surrounded by " - " with spaces is usually the page number,
+  NOT a document code like "0005" in "ESN-0005-0A" (no spaces around it).
+  After reading each page, ALWAYS state: "Physical {{N}} 的印刷頁碼是 {{X}}。"
+
+If the printed page X ≠ expected page number:
+  offset = physical - printed  (e.g. 110 - 92 = 18)
   To reach printed p.N: read physical page N + offset
 
 ALWAYS read ONE page at a time when navigating — never a range.
@@ -219,6 +239,18 @@ The <AvailableImageFiles> tag is MANDATORY in every final answer that includes i
 Use only the filename (not full path) inside the tag.
 List ALL rendered image files, comma-separated.
 
+=== SESSION MEMORY ===
+
+Every read_pdf_pages and search_pdf_text result is automatically saved to:
+  output/session_reads.md
+
+If a tool result has been compacted and you see:
+  "[Compacted — full content saved in session_reads.md ...]"
+→ Call read_file("output/session_reads.md") to retrieve the full original content.
+
+When answering a follow-up question that requires details from previously read pages,
+ALWAYS check session_reads.md first before re-reading the PDF.
+
 Use the todo tool to track multi-step tasks.
 IMPORTANT: Every time you call todo, include ALL tasks in the list.
 NEVER mark a task completed if it returned an error.
@@ -247,21 +279,28 @@ def estimate_tokens(messages: list) -> int:
     return total
 
 
-def micro_compact(messages: list) -> list:
+def micro_compact(messages: list) -> tuple:
+    """Returns (messages, content_was_cleared)."""
     tool_indices = [i for i, m in enumerate(messages)
                     if m.get("role") == "tool" and m.get("name") != "load_skill"]
     if len(tool_indices) <= KEEP_RECENT:
-        return messages
+        return messages, False
     to_clear = tool_indices[:-KEEP_RECENT]
     cleared = 0
+    content_cleared = False
     for idx in to_clear:
         msg = messages[idx]
         if isinstance(msg.get("content"), str) and len(msg["content"]) > 100:
-            messages[idx]["content"] = f"[Previous result: {msg.get('name', 'unknown')}]"
+            name = msg.get("name", "unknown")
+            if name in CONTENT_TOOLS:
+                messages[idx]["content"] = "[Compacted — full content saved in output/session_reads.md]"
+                content_cleared = True
+            else:
+                messages[idx]["content"] = f"[Previous result: {name}]"
             cleared += 1
     if cleared:
         print(f"[micro_compact: cleared {cleared} old tool results]")
-    return messages
+    return messages, content_cleared
 
 
 def auto_compact(messages: list) -> list:
@@ -340,29 +379,6 @@ def run_get_pdf_info(path: str) -> str:
         return f"Error reading PDF: {e}"
 
 
-def _extract_printed_page_number(text: str) -> str:
-    """Extract the printed page number from header/footer.
-
-    Footer format in this document:
-      SYL-TK01-OPM-ESN-0005-0A - 92 - OCT, 2025
-    The page number sits between ' - ' (space-dash-space) separators.
-    We must NOT match the '0005' inside 'ESN-0005-0A' (no surrounding spaces).
-    """
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    candidates = []
-    for line in lines[:3] + lines[-3:]:
-        # Match " - NUMBER - " with explicit spaces (avoids ESN-0005-0A false positives)
-        matches = re.findall(r' - (\d+) - ', line)
-        candidates.extend(matches)
-        # Also catch Roman numeral pages: " - vi - "
-        rom = re.findall(r' - ([ivxlcdmIVXLCDM]+) - ', line)
-        candidates.extend(rom)
-        # Short standalone number line (e.g. bare "92" in some PDFs)
-        if len(line) < 10 and re.fullmatch(r'\d+', line):
-            candidates.append(line)
-    return candidates[-1] if candidates else "unknown"
-
-
 def run_read_pdf_pages(path: str, pages: str) -> str:
     """Extract text layer for navigation. NOT for final output — use render_pdf_pages for images."""
     if not PDFPLUMBER_AVAILABLE:
@@ -386,18 +402,26 @@ def run_read_pdf_pages(path: str, pages: str) -> str:
                 page = pdf.pages[page_num - 1]
                 text = page.extract_text() or ""
                 if text.strip():
-                    printed = _extract_printed_page_number(text)
-                    header = (
-                        f"--- Physical Page {page_num} | "
-                        f"Printed page number detected: [{printed}] ---"
+                    lines = [l for l in text.strip().splitlines() if l.strip()]
+                    header_lines = "\n".join(lines[:3])
+                    footer_lines = "\n".join(lines[-3:]) if len(lines) > 3 else ""
+                    block = (
+                        f"--- Physical Page {page_num} ---\n"
+                        f"[HEADER LINES]\n{header_lines}\n"
+                        f"...\n"
+                        f"{text.strip()}\n"
+                        f"...\n"
+                        f"[FOOTER LINES]\n{footer_lines}"
                     )
-                    results.append(f"{header}\n{text.strip()}")
+                    results.append(block)
                 else:
                     results.append(
-                        f"--- Physical Page {page_num} | Printed page: [unknown] ---\n"
+                        f"--- Physical Page {page_num} ---\n"
                         f"[No extractable text — likely scanned image or diagram]"
                     )
-        return "\n\n".join(results)
+        output = "\n\n".join(results)
+        _session_append("read_pdf_pages", {"path": path, "pages": pages}, output)
+        return output
     except Exception as e:
         return f"Error reading PDF pages: {e}"
 
@@ -418,20 +442,24 @@ def run_search_pdf_text(path: str, query: str, max_results: int = 10) -> str:
                 page = pdf.pages[page_num - 1]
                 text = page.extract_text() or ""
                 if query_lower in text.lower():
-                    printed = _extract_printed_page_number(text)
+                    lines = [l for l in text.strip().splitlines() if l.strip()]
+                    footer = " | ".join(lines[-3:]) if lines else ""
                     # Find context around match
                     idx = text.lower().find(query_lower)
                     start = max(0, idx - 80)
                     end = min(len(text), idx + len(query) + 120)
                     snippet = text[start:end].replace("\n", " ").strip()
                     results.append(
-                        f"Physical page {page_num} (printed: {printed}): ...{snippet}..."
+                        f"Physical page {page_num} "
+                        f"(footer: [{footer}]): ...{snippet}..."
                     )
                     if len(results) >= max_results:
                         break
         if not results:
             return f"No matches found for: {query!r}"
-        return f"Found {len(results)} match(es) for {query!r}:\n\n" + "\n\n".join(results)
+        output = f"Found {len(results)} match(es) for {query!r}:\n\n" + "\n\n".join(results)
+        _session_append("search_pdf_text", {"path": path, "query": query}, output)
+        return output
     except Exception as e:
         return f"Error searching PDF: {e}"
 
@@ -677,9 +705,11 @@ CHILD_TOOLS = [
     {"type": "function", "function": {
         "name": "render_pdf_pages",
         "description": (
-            "Render PDF pages as JPEG images. Use AFTER confirming the correct physical "
-            "page range via read_pdf_pages or search_pdf_text. Images saved to output/ directory. "
-            "Max 20 pages per call. Use physical page numbers (not printed page numbers)."
+            "Render PDF pages as JPEG images. Images saved to output/ directory. "
+            "Max 20 pages per call. Use physical page numbers (not printed page numbers). "
+            "⚠️  MANDATORY: You MUST have called read_pdf_pages on EVERY page in this range "
+            "before calling render. Never render pages you have not yet read as text. "
+            "If you skipped reading any page in the range, read it first."
         ),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Relative path to PDF"},
@@ -773,11 +803,20 @@ def run_subagent(prompt: str) -> str:
 # ── Agent loop ────────────────────────────────────────────────────────────────────
 def agent_loop(messages: list):
     rounds_since_todo = 0
+    compaction_reminder_sent = False
     while True:
-        micro_compact(messages)
+        tokens_before = estimate_tokens(messages)
+        messages, content_cleared = micro_compact(messages)
+        tokens_after = estimate_tokens(messages)
+        if tokens_after != tokens_before:
+            print(f"[context: {tokens_before:,} → {tokens_after:,} tokens after micro_compact]")
+        else:
+            print(f"[context: {tokens_before:,} tokens]")
+        # content_cleared is noted but reminder is deferred to final-answer check
         if estimate_tokens(messages) > THRESHOLD:
-            print("[auto_compact triggered]")
+            print(f"[auto_compact triggered: {estimate_tokens(messages):,} tokens > threshold {THRESHOLD:,}]")
             messages[:] = auto_compact(messages)
+            print(f"[context after auto_compact: {estimate_tokens(messages):,} tokens]")
 
         from openai import BadRequestError
         try:
@@ -802,6 +841,21 @@ def agent_loop(messages: list):
             if incomplete:
                 messages.append({"role": "user", "content": "<reminder>Mark all completed tasks in your todo list before finishing.</reminder>"})
                 continue
+            # Before accepting final answer, check if any PDF content was compacted.
+            # Only inject the reminder once — if already sent, accept the answer.
+            if not compaction_reminder_sent:
+                has_compacted = any(
+                    "[Compacted — full content saved in output/session_reads.md]" in str(m.get("content", ""))
+                    for m in messages if m.get("role") == "tool"
+                )
+                if has_compacted:
+                    messages.append({"role": "user", "content":
+                        "<reminder>⚠️ 你的回答可能不完整！部分 PDF 頁面內容已被壓縮。"
+                        "請立即呼叫 read_file('output/session_reads.md') 取回所有曾讀取的頁面內容，"
+                        "對照完整資料後再給出最終答案。</reminder>"
+                    })
+                    compaction_reminder_sent = True
+                    continue
             return
 
         results = []
@@ -834,12 +888,12 @@ def agent_loop(messages: list):
             elif name == "list_pdfs":
                 print(f"> list_pdfs:\n{str(output)}")
             elif name == "read_pdf_pages":
-                preview = str(output)[:300]
-                print(f"> read_pdf_pages (p.{args.get('pages', '?')}): {preview}...")
+                preview = str(output)[:1500]
+                print(f"> read_pdf_pages (p.{args.get('pages', '?')}):\n{preview}...")
             elif name == "search_pdf_text":
                 q = args.get("query", "")
-                preview = str(output)[:400]
-                print(f"> search_pdf_text ({q!r}): {preview}...")
+                preview = str(output)[:800]
+                print(f"> search_pdf_text ({q!r}):\n{preview}...")
             elif name == "render_pdf_pages":
                 print(f"> render_pdf_pages (p.{args.get('pages', '?')}): {str(output)[:300]}")
             elif name == "open_files":
@@ -857,6 +911,7 @@ def agent_loop(messages: list):
         for result in results:
             messages.append(result)
 
+        compaction_reminder_sent = False  # reset: LLM made tool calls, still working
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
@@ -870,12 +925,17 @@ def agent_loop(messages: list):
             })
 
         if manual_compact:
-            print("[manual compact]")
+            print(f"[manual compact: {estimate_tokens(messages):,} tokens before]")
             messages[:] = auto_compact(messages)
+            print(f"[manual compact done: {estimate_tokens(messages):,} tokens after]")
+            content_cleared = False
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Clear session reads file at startup
+    SESSION_READS_FILE.write_text("# Session Reads\n\nAll read_pdf_pages and search_pdf_text results are logged here.\n")
+
     missing = []
     if not PDFPLUMBER_AVAILABLE:
         missing.append("pdfplumber")
