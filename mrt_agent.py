@@ -54,15 +54,15 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 6
-SESSION_READS_FILE = OUTPUT_DIR / "session_reads.md"
 CONTENT_TOOLS = {"read_pdf_pages", "search_pdf_text"}
 
 
-def _session_append(tool_name: str, args: dict, content: str):
-    """Append a tool result to the session reads file for later retrieval."""
-    with open(SESSION_READS_FILE, "a", encoding="utf-8") as f:
-        label = ", ".join(f"{k}={v}" for k, v in args.items())
-        f.write(f"\n\n---\n## [{tool_name}] {label}\n\n{content}\n")
+def run_write_note(content: str, note_id: int) -> str:
+    """Append relevant content to pdf_reading_note_N.txt. Called by LLM when content is relevant."""
+    note_path = OUTPUT_DIR / f"pdf_reading_note_{note_id}.txt"
+    with open(note_path, "a", encoding="utf-8") as f:
+        f.write(content + "\n")
+    return f"Appended to {note_path.name} ({len(content)} chars)"
 
 
 # ── SkillLoader ────────────────────────────────────────────────────────────────
@@ -175,15 +175,19 @@ Step 5 — Once confirmed: read_pdf_pages(path, "1-5") to find the Table of Cont
          keep reading in batches of 5 (read "6-10", then "11-15" if needed) until you reach a page
          that no longer has TOC content.
          Write out the FULL TOC (all chapters + subsections with printed page numbers).
+         Then IMMEDIATELY call write_note("[TOC]\n<TOC content>", note_id=1) to save the TOC.
 Step 6 — search_pdf_text again with more specific keywords to get the exact physical page.
 Step 7 — read_pdf_pages ONE physical page at a time to VERIFY correct location.
-         Each result header shows: "Physical Page N | Printed page number detected: [X]"
          ALWAYS state: "Physical {{N}} 的印刷頁碼是 {{X}}。"
          If X ≠ expected → adjust: new_physical = current + (expected - X), re-read.
+         After reading each page:
+           - If content IS relevant to the question → IMMEDIATELY call
+             write_note(excerpt, note_id) before reading the next page.
+           - If content is NOT relevant → skip, do not write.
 Step 8 — Keep reading until a NEW section heading appears (Rule 2).
          ⚠️  MANDATORY: After finding content on page N, ALWAYS read page N+1.
          If N+1 starts new heading → section ends at N.
-         If N+1 continues → collect, read N+2. Repeat.
+         If N+1 continues → write relevant parts to note, read N+2. Repeat.
          NEVER stop without reading the next page.
 Step 9 — render_pdf_pages with confirmed physical page numbers → JPEG saved to output/.
 Step 10 — open_files to display images.
@@ -244,15 +248,15 @@ List ALL rendered image files, comma-separated.
 
 === SESSION MEMORY ===
 
-Every read_pdf_pages and search_pdf_text result is automatically saved to:
-  output/session_reads.md
+As you read PDFs, write relevant excerpts to note files using write_note(content, note_id).
+Note files are saved to output/pdf_reading_note_N.txt (one per PDF, N=1,2,3...).
 
 If a tool result has been compacted and you see:
-  "[Compacted — full content saved in session_reads.md ...]"
-→ Call read_file("output/session_reads.md") to retrieve the full original content.
+  "[Compacted — check output/pdf_reading_note_*.txt for saved excerpts]"
+→ Call read_file("output/pdf_reading_note_1.txt") (and note_2, note_3 etc.) to retrieve
+  the relevant content you previously saved.
 
-When answering a follow-up question that requires details from previously read pages,
-ALWAYS check session_reads.md first before re-reading the PDF.
+When answering, read from the note files — do NOT re-read the PDF from scratch.
 
 Use the todo tool to track multi-step tasks.
 IMPORTANT: Every time you call todo, include ALL tasks in the list.
@@ -296,7 +300,7 @@ def micro_compact(messages: list) -> tuple:
         if isinstance(msg.get("content"), str) and len(msg["content"]) > 100:
             name = msg.get("name", "unknown")
             if name in CONTENT_TOOLS:
-                messages[idx]["content"] = "[Compacted — full content saved in output/session_reads.md]"
+                messages[idx]["content"] = "[Compacted — check output/pdf_reading_note_*.txt for saved excerpts]"
                 content_cleared = True
             else:
                 messages[idx]["content"] = f"[Previous result: {name}]"
@@ -422,9 +426,7 @@ def run_read_pdf_pages(path: str, pages: str) -> str:
                         f"--- Physical Page {page_num} ---\n"
                         f"[No extractable text — likely scanned image or diagram]"
                     )
-        output = "\n\n".join(results)
-        _session_append("read_pdf_pages", {"path": path, "pages": pages}, output)
-        return output
+        return "\n\n".join(results)
     except Exception as e:
         return f"Error reading PDF pages: {e}"
 
@@ -460,9 +462,7 @@ def run_search_pdf_text(path: str, query: str, max_results: int = 10) -> str:
                         break
         if not results:
             return f"No matches found for: {query!r}"
-        output = f"Found {len(results)} match(es) for {query!r}:\n\n" + "\n\n".join(results)
-        _session_append("search_pdf_text", {"path": path, "query": query}, output)
-        return output
+        return f"Found {len(results)} match(es) for {query!r}:\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"Error searching PDF: {e}"
 
@@ -622,6 +622,7 @@ TOOL_HANDLERS = {
     "read_file":         lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":        lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":         lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "write_note":        lambda **kw: run_write_note(kw["content"], kw["note_id"]),
     "todo":              lambda **kw: TODO.update(kw["items"]),
     "load_skill":        lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "get_pdf_info":      lambda **kw: run_get_pdf_info(kw["path"]),
@@ -668,6 +669,19 @@ CHILD_TOOLS = [
     {"type": "function", "function": {
         "name": "load_skill", "description": "Load specialized knowledge by name.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+    }},
+    {"type": "function", "function": {
+        "name": "write_note",
+        "description": (
+            "Append relevant PDF content to a note file (output/pdf_reading_note_N.txt). "
+            "Call this ONLY when the page content is relevant to the question. "
+            "Use note_id=1 for the first PDF, note_id=2 for the second, etc. "
+            "Write concise excerpts — do NOT dump entire pages."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "content": {"type": "string", "description": "Relevant excerpt to save"},
+            "note_id": {"type": "integer", "description": "Note file number (1, 2, 3...)"}
+        }, "required": ["content", "note_id"]}
     }},
     {"type": "function", "function": {
         "name": "get_pdf_info",
@@ -848,14 +862,15 @@ def agent_loop(messages: list):
             # Only inject the reminder once — if already sent, accept the answer.
             if not compaction_reminder_sent:
                 has_compacted = any(
-                    "[Compacted — full content saved in output/session_reads.md]" in str(m.get("content", ""))
+                    "[Compacted — check output/pdf_reading_note_*.txt for saved excerpts]" in str(m.get("content", ""))
                     for m in messages if m.get("role") == "tool"
                 )
                 if has_compacted:
                     messages.append({"role": "user", "content":
-                        "<reminder>⚠️ 你的回答可能不完整！部分 PDF 頁面內容已被壓縮。"
-                        "請立即呼叫 read_file('output/session_reads.md') 取回所有曾讀取的頁面內容，"
-                        "對照完整資料後再給出最終答案。</reminder>"
+                        "<reminder>Some PDF tool results were compacted. "
+                        "Call read_file('output/pdf_reading_note_1.txt') "
+                        "(and note_2, note_3 if they exist) to retrieve the excerpts "
+                        "you saved, then give your final answer.</reminder>"
                     })
                     compaction_reminder_sent = True
                     continue
@@ -936,8 +951,9 @@ def agent_loop(messages: list):
 
 # ── Main ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Clear session reads file at startup
-    SESSION_READS_FILE.write_text("# Session Reads\n\nAll read_pdf_pages and search_pdf_text results are logged here.\n")
+    # Clear note files from previous session at startup
+    for _f in OUTPUT_DIR.glob("pdf_reading_note_*.txt"):
+        _f.unlink()
 
     missing = []
     if not PDFPLUMBER_AVAILABLE:

@@ -1,0 +1,138 @@
+Update Log — 2026-04-27
+======================
+
+## 1. Fix: Infinite loop in compaction reminder
+File: mrt_agent.py, gemma4_mrt_agent.py
+
+Added `compaction_reminder_sent` flag in `agent_loop()`.
+Previously, `has_compacted` check fired every time the LLM tried to give a final
+answer, because compacted tool messages were never removed from history.
+Now the reminder is injected at most once per answer cycle; if the LLM makes any
+tool call afterward, the flag resets to False.
+
+
+## 2. Fix: Printed page number detection — remove regex, expose HEADER/FOOTER LINES
+File: mrt_agent.py, gemma4_mrt_agent.py
+
+Removed `_extract_printed_page_number()` function.
+Different documents use incompatible footer formats:
+  - MRT manual:   "SYL-TK01-OPM-ESN-0005-0A - 92 - OCT, 2025"  → page 92
+  - Gov report:   "2-13"  (standalone last line)                  → page 2-13
+  - Front matter: "IX"                                             → Roman numeral
+
+`read_pdf_pages` now exposes [HEADER LINES] (first 3 lines) and [FOOTER LINES]
+(last 3 lines) of each page, letting the LLM interpret the format itself.
+
+Added disambiguation note to system prompt and SKILL.md:
+  Numbers in TOC body text (e.g. "3.2.4 Emergency Mode .... 44") are references
+  to OTHER pages, NOT the printed number of the current page being read.
+  The current page's printed number comes ONLY from [HEADER LINES] / [FOOTER LINES].
+
+
+## 3. New: write_note tool — selective note-taking replaces auto-save session_reads.md
+File: mrt_agent.py, gemma4_mrt_agent.py
+
+Removed: automatic `_session_append()` in read_pdf_pages / search_pdf_text.
+Added:   `write_note(content: str, note_id: int)` tool.
+
+Design change:
+  - Previously ALL page content was auto-saved to output/session_reads.md
+  - Now the LLM explicitly calls write_note() ONLY for relevant content
+  - Note files: output/pdf_reading_note_1.txt, pdf_reading_note_2.txt, ...
+    (one per PDF read; numbered sequentially)
+  - Startup clears all pdf_reading_note_*.txt from previous session
+
+Compact placeholder updated:
+  "[Compacted — check output/pdf_reading_note_*.txt for saved excerpts]"
+
+write_note added to MANDATORY WORKFLOW in system prompt:
+  - Step 5: after reading TOC, immediately call write_note("[TOC]\n...", note_id=1)
+  - Step 7: after each page read, immediately call write_note if content is relevant
+
+
+## 4. New: gemma4_mrt_agent.py — Gemma 4 variant using local vLLM server
+File: gemma4_mrt_agent.py (new file)
+
+Drop-in alternative to mrt_agent.py. Uses OpenAI-compatible client pointed at
+a local vLLM server instead of Azure OpenAI.
+
+Key differences from mrt_agent.py:
+  - Client: OpenAI(base_url=VLLM_BASE_URL, api_key="none")
+  - Default model: google/gemma-4-E4B-it
+  - Configurable via env vars: VLLM_BASE_URL, VLLM_MODEL
+  - max_tokens: 8000 (conservative for Gemma 4 context)
+  - Exception handling: generic except instead of AzureOpenAI BadRequestError
+  - Startup banner shows vLLM URL and model name
+
+Usage:
+  python3 gemma4_mrt_agent.py
+  VLLM_BASE_URL=http://10.22.100.103:8000/v1 python3 gemma4_mrt_agent.py
+
+
+## 5. New: test_gemma4.py — quick sanity test for vLLM Gemma 4
+File: test_gemma4.py (new file)
+
+Three tests: basic reply, reasoning, token usage reporting.
+
+
+## 6. Change: TOC reading — dynamic 1-5 instead of fixed 1-15
+File: mrt_agent.py, gemma4_mrt_agent.py, skills/pdf-reading/SKILL.md
+
+Was:  read_pdf_pages(path, "1-15") always
+Now:  start with "1-5"; if last page still has TOC entries, continue in batches of 5
+      ("6-10", "11-15", ...) until a page with no TOC content appears.
+
+
+## 7. SKILL.md rewrite: PDF ranking + note-taking workflow
+File: skills/pdf-reading/SKILL.md
+
+Full rewrite. New structure:
+
+  Step 0 — Note file naming (pdf_reading_note_N.txt, cleared at startup)
+  Step 1 — PDF Relevance List: explicit 0.0–1.0 scores, mandatory format:
+            [score=0.95] note_id=1  MRT_docs/xxx.pdf
+                         理由：...
+  Step 2 — Reading workflow (2.1–2.5):
+            2.1 Read TOC p.1-5, write TOC to note
+            2.2 Write relevant page content to note
+            2.3 Skip irrelevant pages (no write)
+            2.4 Read multiple sections if needed
+            2.5 Always read next page before stopping
+  Step 3 — Note Assessment (mandatory before stopping):
+            - Restate question
+            - List what notes cover
+            - List what's missing
+            - Decision: SUFFICIENT / INSUFFICIENT → read next PDF
+  Step 4 — Answer from notes (read_file note, do not re-read PDF)
+
+  Rule A — Dynamic Page Navigation (retained from old Rule 1):
+            Physical ≠ printed; read one page at a time; calculate offset
+            ⚠️ Added: distinguish footer page number vs TOC body references
+  Rule B — Image-Only Pages (retained from old Rule 3)
+  Rule C — Multi-Column Tables (retained from old Rule 4)
+
+  Quick Checklist updated to match new steps.
+
+
+## 8. New: Timing logs in gemma4_mrt_agent.py
+File: gemma4_mrt_agent.py
+
+Added elapsed time display for:
+  [LLM: X.Xs]              — after each API call (inference time)
+  > read_pdf_pages [X.XXs]  — after each tool execution
+  > write_note [X.XXs]
+  > search_pdf_text [X.XXs]
+  > render_pdf_pages [X.XXs]
+  > read_file [X.XXs]
+  (etc. for all tools)
+
+
+## 9. README.md updated
+File: README.md
+
+  - Updated 印刷頁碼判讀 section: explains why LLM-based detection is used
+    instead of regex (cross-document format differences)
+  - Added session_reads.md → pdf_reading_note_N.txt migration explanation
+  - Updated 工具清單 table: added write_note, updated read_pdf_pages description
+  - Updated Context 壓縮策略 table
+  - Added token count display example

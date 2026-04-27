@@ -1,6 +1,6 @@
 ---
 name: pdf-reading
-description: Best practices for reading PDFs — load this skill before extracting any content from a PDF. Covers page offset correction, reading completeness, and handling edge cases like tables, image-only pages, and multi-page sections.
+description: Best practices for reading PDFs — load this skill before extracting any content from a PDF. Covers PDF ranking, note-taking, page offset correction, reading completeness, and edge cases.
 tags: pdf
 ---
 
@@ -10,143 +10,174 @@ Load this skill before extracting content from any PDF.
 
 ---
 
-## Rule 1 — Dynamic Page Navigation
+## Step 0 — Note Files
+
+Note files (`pdf_reading_note_N.txt`) are cleared at system startup automatically.
+Each PDF you read gets its own note file. Assign `note_id` sequentially:
+- First PDF read → `note_id=1` → `output/pdf_reading_note_1.txt`
+- Second PDF read → `note_id=2` → `output/pdf_reading_note_2.txt`
+- etc.
+
+---
+
+## Step 1 — Rank PDFs by Relevance
+
+After `list_pdfs()`, output an **explicit ranked list** before doing anything else.
+Each entry must include a numeric relevance score (0.0 = unrelated, 1.0 = perfect match).
+
+Format (MANDATORY — write this out exactly):
+```
+PDF Relevance List:
+[score=0.95] note_id=1  MRT_docs/系統概述_月臺門操作及維修手冊.pdf
+             理由：檔名含「月臺門」「操作及維修」，與問題高度相關
+[score=0.30] note_id=2  MRT_docs/113電巴資料報告.pdf
+             理由：電動巴士資料，與月臺門維修無直接關聯
+[score=0.05] note_id=3  MRT_docs/Spec_IB9387.pdf
+             理由：英文規格書，非維修手冊
+
+Decision: Start with note_id=1 (score=0.95). Threshold to skip: score < 0.15.
+```
+
+⛔ NEVER jump to reading a PDF before writing out this list.
+⛔ NEVER omit the score or reason for any file.
+
+---
+
+## Step 2 — Reading Workflow (one PDF at a time)
+
+Start with the highest-scored PDF (note_id=1).
+
+### 2.1 TOC Scan
+
+```
+read_pdf_pages(path, "1-5")
+```
+- If the last page still has TOC entries, keep reading in batches of 5 until TOC ends.
+- Write a TOC summary to the note file:
+  ```
+  write_note("[TOC summary]\n第1章 系統概述 ... p.1\n  1.1 適用範圍 ... p.2\n...", note_id)
+  ```
+- From the TOC, identify which chapter/section likely contains the answer.
+- State explicitly: "問題關於 X，對應章節為 Y.Z，印刷頁約在 p.N。"
+
+### 2.2 Write Relevant Content
+
+If a page contains content **relevant to the question**:
+```
+write_note("[Physical p.N | Printed p.X]\n<excerpt of relevant content>", note_id)
+```
+Be selective — copy the exact sentences/tables/numbers that answer the question.
+Do NOT dump entire pages into the note.
+
+### 2.3 Skip Irrelevant Content
+
+If a page is NOT relevant to the question: do NOT write it to the note. Simply move on.
+
+### 2.4 Read Multiple Sections if Needed
+
+A complete answer may require reading several chapters or subsections.
+After finishing one section, check: is there another section in the TOC that might
+also contain relevant information? If yes, jump there and continue.
+
+### 2.5 Read Until Section Clearly Ends
+
+Once you find relevant content on page N:
+- ALWAYS read page N+1 before stopping.
+- If N+1 starts a new unrelated section → section ends at N. Stop.
+- If N+1 continues the same topic → write relevant parts, read N+2. Repeat.
+
+⛔ NEVER stop on the current page alone — you cannot know if the section
+   continues until you have seen the next page.
+
+---
+
+## Step 3 — Decide: Enough or Continue to Next PDF?
+
+After finishing the current PDF, assess your notes:
+
+```
+Note Assessment:
+- Question: <restate the question>
+- Notes so far cover: <list what you found>
+- Missing: <list what's still unanswered, or "nothing">
+- Decision: SUFFICIENT → go to Step 4 / INSUFFICIENT → read next PDF (note_id=N+1)
+```
+
+⛔ NEVER skip this assessment step.
+If INSUFFICIENT: repeat Step 2 for the next PDF in the ranked list.
+
+---
+
+## Step 4 — Answer from Notes
+
+Read the note file(s) and answer the question faithfully based on their content.
+```
+read_file("output/pdf_reading_note_1.txt")
+```
+Do NOT re-read PDFs if the notes are sufficient.
+If notes turn out to be incomplete, go back to Step 2 for the relevant PDF.
+
+---
+
+## Rule A — Dynamic Page Navigation
 
 PDFs often have a gap between physical page numbers (position in file) and printed
-page numbers (shown in header/footer). This gap may vary across sections
-(e.g. Roman numerals for front matter, Arabic for main content).
+page numbers (shown in header/footer). **Do NOT assume a fixed offset. Navigate dynamically.**
 
-**Do NOT assume a fixed offset. Navigate dynamically instead.**
-
-### Strategy: Read ONE page → State printed number → Adjust
-
-When TOC says target is at printed page N:
-
-1. **Read ONE physical page** (just `read_pdf_pages("doc.pdf", "N")` — not a range).
-2. **Explicitly state**: "The printed page number on this page is: X"
-   Look at the very beginning or end of the extracted text for a standalone number
-   like `"54"`, `"- 54 -"`, `"第54頁"`.
-3. **Compare and adjust**:
-   - X = N → you're there ✓
-   - X < N → jump forward: new physical = current_physical + (N - X)
-   - X > N → jump backward: new physical = current_physical - (X - N)
-4. **Repeat** reading ONE page at a time until printed number = N.
-
-> **Why one page at a time?** Reading ranges (e.g. 64-67) buries footer numbers
-> in a wall of text. Reading a single page makes the printed number easy to spot.
-
-### Example
-
-TOC says tool list at printed p.64.
-
-| Step | Physical page read | Footer shows | Action |
-|------|--------------------|--------------|--------|
-| 1 | 64 | 54 | Need +10 → jump to 74 |
-| 2 | 74 | 64 | ✓ Found it |
-
-### Why not a fixed offset?
-
-- Front matter (cover, TOC) may have no printed number or Roman numerals
-- Main content starts at a different printed page
-- Offset may change at chapter or section boundaries
-
-Always verify by checking the actual printed number on each page you read.
-
----
-
-## Rule 2 — Reading Completeness
-
-**After finding your target content, you MUST always read the next page before stopping.**
-
-The decision to stop is made by reading the NEXT page, not the current one:
-
+Each `read_pdf_pages` result includes:
 ```
-read page N  →  collect content
-read page N+1  →  decision point:
-    does page N+1 START with a new section/chapter heading?
-    YES → stop (page N was the last page of the section)
-    NO  → collect content from N+1, then read page N+2
-read page N+2  →  decision point:
-    ...repeat until a new heading appears
+[HEADER LINES]  ← first 3 lines of the page
+[FOOTER LINES]  ← last 3 lines of the page
 ```
 
-⛔ NEVER decide to stop based on the current page alone — you cannot know if the
-   section continues until you have seen what comes next.
+After reading each page, ALWAYS state:
+> "Physical N 的印刷頁碼是 X。"
 
-⛔ NEVER stop because:
-- The current page "looks complete"
-- A numbered list "seems done" (items 1-4 visible)
-- You reached the bottom of a page
+Common footer formats (varies by document):
+- `SYL-TK01-OPM-ESN-0005-0A - 92 - OCT, 2025` → printed page = **92** (number between spaces)
+- `- 92 -` → printed page = **92**
+- `2-13` (standalone last line) → printed page = **2-13** (chapter-page format)
+- `IX` → Roman numeral front matter
 
-✅ Stop ONLY after reading a page that BEGINS with a new section/chapter heading
-   (e.g. "4.2.2 ...", "第5章 ...", or any heading at the same or higher level).
+If printed X ≠ expected page number:
+```
+offset = physical − printed   (e.g. physical 110, printed 92 → offset = 18)
+target_physical = desired_printed_page + offset
+```
+Re-read at corrected physical page and verify.
 
----
+Strategy:
+1. Use `search_pdf_text` first to get an approximate physical page.
+2. Read that physical page → state the printed number → calculate offset if needed.
+3. Jump to corrected physical page → verify → proceed.
 
-## Rule 3 — Image-Only Pages
-
-If `read_pdf_pages` returns `[No extractable text on this page]`, the page is likely
-a scanned image or diagram. Options:
-- Skip it and read the next page for context
-- Note that a figure/diagram exists at that location
-- Do NOT attempt OCR — `read_pdf_pages` only handles text layers
-
----
-
-## Rule 4 — Multi-Column Tables
-
-PDF text extraction may scramble multi-column table content (columns merged into
-one stream). If extracted text looks garbled or out of order:
-- Read a few rows and try to identify column boundaries manually
-- Mention to the user that the table may need manual verification
+Always read ONE page at a time when navigating — never a range.
 
 ---
 
-## Rule 5 — Reading Strategy
+## Rule B — Image-Only Pages
 
-For large PDFs (100+ pages):
-1. `get_pdf_info` → know total pages
-2. Read pages 1-5 → find Table of Contents. If the last page still has TOC entries,
-   keep reading in batches of 5 until a page with no TOC content appears.
-3. **MANDATORY: Write out the complete TOC before doing anything else.**
+If `read_pdf_pages` returns `[No extractable text — likely scanned image or diagram]`:
+- Note its existence: `write_note("[Physical p.N] 圖表頁，無文字層", note_id)`
+- Skip and read the next page for context.
 
-   After reading the TOC pages, your VERY NEXT output MUST be a list like this
-   (include ALL levels — chapters AND subsections):
-   ```
-   TOC 目錄:
-   第1章 系統概述 .......................... p.1
-     1.1 適用範圍 .......................... p.2
-     1.2 縮寫與定義 ........................ p.4
-   第4章 系統元件 .......................... p.55
-     4.1 自動滑門 .......................... p.56
-     4.4 維修程序 .......................... p.98
-       4.4.9 矯正性維修 .................... p.119
-       4.4.9.9 特殊工具及測試設備 ......... p.128
-   第5章 故障排除 .......................... p.140
-   ```
-   Copy ALL headings VERBATIM from the document (do not translate or summarize).
-   Include subsections (1.1, 4.4.9, etc.) — the target content is often in a subsection,
-   not at the chapter level.
+---
 
-   ⛔ NEVER mark a "read TOC" task as done without having written out this list.
-   ⛔ NEVER jump to a section page before writing out this list.
+## Rule C — Multi-Column Tables
 
-   If the TOC spans multiple pages or is incomplete, read more pages before listing.
-
-4. Identify which section contains your target content by scanning your written TOC list.
-   Search for keywords in the document's language (e.g. for Chinese docs, search Chinese
-   terms like "工具清單", "特殊工具", "維修設備" — NOT English translations).
-5. Navigate to that section using dynamic page offset correction (Rule 1).
-6. Read section start → read next page → stop only when section clearly ends (Rule 2).
-7. Do NOT read sequentially page by page — use the TOC to jump to relevant sections.
+PDF text extraction may scramble multi-column tables. If extracted text looks garbled:
+- Write a flag: `write_note("[Physical p.N] 表格內容可能亂序，需人工核對原始圖像", note_id)`
+- Mention to the user that the table may need manual verification.
 
 ---
 
 ## Quick Checklist
 
-Before answering any question based on a PDF:
-- [ ] Did I write out the TOC findings (chapter names + page numbers) before navigating?
-- [ ] Did I verify the printed page number after landing on a new page (Rule 1)?
-- [ ] Did I keep reading until I saw a NEW section/chapter heading (Rule 2)?
-- [ ] Did I handle any image-only pages gracefully?
-- [ ] Did I note if any table content looked garbled?
+Before answering:
+- [ ] Did I write the PDF Relevance List with explicit scores (Step 1)?
+- [ ] Did I write a TOC summary to the note file (Step 2.1)?
+- [ ] Did I write ONLY relevant content to the note (Step 2.2/2.3)?
+- [ ] Did I state "Physical N 的印刷頁碼是 X" after each page (Rule A)?
+- [ ] Did I read the next page before stopping (Step 2.5)?
+- [ ] Did I do the Note Assessment before deciding to stop (Step 3)?
+- [ ] Am I answering from the note file, not from memory (Step 4)?
